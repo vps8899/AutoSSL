@@ -261,7 +261,7 @@ poll_and_download() {
   dump_if_debug "$dl"
 
   # 预期字段：certificate.crt / ca_bundle.crt
-  local CERT CRT CA
+  local CRT CA
   CRT="$(echo "$dl" | jq -r '.["certificate.crt"] // empty')"
   CA="$(echo "$dl" | jq -r '.["ca_bundle.crt"] // empty')"
   [[ -n "$CRT" ]] || die "未在下载返回中找到 certificate.crt"
