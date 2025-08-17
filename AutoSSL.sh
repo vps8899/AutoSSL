@@ -2,118 +2,34 @@
 set -euo pipefail
 
 # ============================================================================
-# ZeroSSL 域名/IP 证书一键脚本 - 安装器（适合放到 GitHub，VPS 一键执行）
-# 作用：
-#   1) 检测并安装依赖（curl jq openssl unzip python3）
-#   2) 安装主脚本到 /usr/local/bin/zerossl_ip_oneclick_cn.sh
-#   3) 立即启动主脚本（支持交互；也支持通过环境变量非交互执行）
-#
-# 用法（推荐）：
-#   bash oneclick_install.sh
-#
-# 非交互示例（在执行前/执行时传入环境变量）：
-#   ACCESS_KEY="xxx" MODE="domain" TARGET="www.example.com" bash oneclick_install.sh
-#   ACCESS_KEY="xxx" MODE="ip"     TARGET="203.0.113.10"    bash oneclick_install.sh
-#
-# 变量（可选）：
-#   WEBROOT=/var/www/html
-#   LIVE_DIR=/etc/zerossl-ip/<target>/live
-#   VALID_DAYS=90
-#   KEY_TYPE=rsa:2048 或 ec:prime256v1
-#   DEBUG=0/1
-#
-# 脚本可重复执行；主程序会负责 systemd/cron 定时续签的安装与更新。
-# ============================================================================
-
-as_root() { [[ ${EUID:-$(id -u)} -eq 0 ]]; }
-need_cmd() { command -v "$1" >/dev/null 2>&1; }
-say() { printf "%s\n" "$*"; }
-die() { echo "ERROR: $*" >&2; exit 1; }
-
-# 尝试使用 sudo 提权
-ensure_root() {
-  if as_root; then return 0; fi
-  if need_cmd sudo; then
-    exec sudo -E bash "$0" "$@"
-  else
-    die "需要 root 权限，请以 root 运行，或先安装 sudo。"
-  fi
-}
-
-detect_pm() {
-  if need_cmd apt-get;   then echo apt;   return; fi
-  if need_cmd dnf;       then echo dnf;   return; fi
-  if need_cmd yum;       then echo yum;   return; fi
-  if need_cmd apk;       then echo apk;   return; fi
-  if need_cmd pacman;    then echo pacman;return; fi
-  echo "unknown"
-}
-
-install_deps() {
-  local pm; pm="$(detect_pm)"
-  say "==> 检测到包管理器：$pm"
-  case "$pm" in
-    apt)
-      export DEBIAN_FRONTEND=noninteractive
-      apt-get update -y
-      apt-get install -y curl jq openssl unzip python3 ca-certificates
-      update-ca-certificates || true
-      ;;
-    dnf)
-      dnf install -y curl jq openssl unzip python3 ca-certificates
-      update-ca-trust || true
-      ;;
-    yum)
-      # 适配老系统：先装 epel 以获取 jq/python3
-      yum install -y epel-release || true
-      yum install -y curl jq openssl unzip python3 ca-certificates || {
-        # 某些极老系统用 python36 包名
-        yum install -y python36 || true
-        need_cmd python3 || die "无法安装 python3，请手动安装后重试。"
-      }
-      update-ca-trust || true
-      ;;
-    apk)
-      apk add --no-cache curl jq openssl unzip python3 ca-certificates
-      update-ca-certificates || true
-      ;;
-    pacman)
-      pacman -Sy --noconfirm curl jq openssl unzip python
-      ;;
-    *)
-      for b in curl jq openssl unzip python3; do
-        need_cmd "$b" || die "未能自动识别包管理器，请手动安装依赖：curl jq openssl unzip python3"
-      done
-      ;;
-  esac
-}
-
-install_main_script() {
-  local dst="/usr/local/bin/zerossl_ip_oneclick_cn.sh"
-  say "==> 写入主脚本到 $dst"
-  umask 022
-  # 注意：这里使用 'EOF_SCRIPT'（带引号）避免变量在写入时被展开
-  cat > "$dst" <<'EOF_SCRIPT'
-#!/usr/bin/env bash
-set -euo pipefail
-
-# ============================================================================
 # ZeroSSL 域名/IP 证书一键脚本（签发 + 自动续签, 中文交互）
-# - 兼容非交互（通过环境变量传参）
-# - 自动安装 systemd timer 或 cron，便于无人值守续签
-# - 修复与强化：trap 不再互相覆盖；systemd 单元使用脚本绝对路径；权限更稳健
-#   新增：KEY_TYPE（rsa:2048 / ec:prime256v1），DEBUG 开关，IPv6 支持
+# 增强：
+#  - 全局日志输出到 $LOG_FILE（默认 /var/log/zerossl_oneclick.log）
+#  - 关键 API 返回体快照保存到 $STATE_DIR/last_*.json 方便排障
+#  - DEBUG=1 开启命令追踪（set -x）
+#  - 其他逻辑与原版保持一致
 # ============================================================================
 
 need_cmd() { command -v "$1" >/dev/null 2>&1 || { echo "需要命令：$1"; exit 1; }; }
-log()      { printf "%s\n" "$*"; }
-die()      { echo "ERROR: $*" >&2; exit 1; }
+log()      { echo "[$(date '+%F %T')] $*"; }
+die()      { echo "[$(date '+%F %T')] ERROR: $*" >&2; exit 1; }
 as_root()  { [[ ${EUID:-$(id -u)} -eq 0 ]]; }
 
-for c in curl jq openssl unzip; do need_cmd "$c"; done
+for c in curl jq openssl unzip awk; do need_cmd "$c"; done
 if [[ -z "${WEBROOT:-}" ]]; then
   need_cmd python3 || die "未检测到 python3，且未提供 WEBROOT；无法临时起 80 端口验证服务"
 fi
+
+# ---- 日志设置 ----
+LOG_FILE="${LOG_FILE:-/var/log/zerossl_oneclick.log}"
+mkdir -p "$(dirname "$LOG_FILE")" || true
+: >"$LOG_FILE" || true
+chmod 600 "$LOG_FILE" 2>/dev/null || true
+# 将 stdout/stderr 同步写入控制台与日志文件，并加时间戳
+exec > >(awk '{ print strftime("[%Y-%m-%d %H:%M:%S]"), $0 }' | tee -a "$LOG_FILE") 2>&1
+
+# DEBUG=1 时打开命令追踪
+[[ "${DEBUG:-0}" == "1" ]] && set -x
 
 ACCESS_KEY="${ACCESS_KEY:-}"
 MODE="${MODE:-}"              # domain / ip
@@ -171,7 +87,7 @@ prompt_access_key_if_needed() {
     read -rsp "请输入 ZeroSSL API Access Key: " ACCESS_KEY
     echo
   fi
-  [[ -n "$ACCESS_KEY" ]] || die "ACCESS_KEY 不能为空"
+  [[ -n "$ACCESS_KEY" ]] || die "ACCESS_KEY 不能为空（请在 ZeroSSL 控制台获取）"
 }
 
 recompute_paths_by_target() {
@@ -182,6 +98,7 @@ recompute_paths_by_target() {
   STATE_DIR="${STATE_DIR:-$CONFIG_DIR/state}"
   LIVE_DIR="${LIVE_DIR:-$CONFIG_DIR/live}"
   ENV_FILE="$STATE_DIR/.env"
+  mkdir -p "$STATE_DIR" "$LIVE_DIR"
 }
 
 persist_env() {
@@ -196,7 +113,8 @@ LIVE_DIR="$LIVE_DIR"
 CONFIG_DIR="$CONFIG_DIR"
 STATE_DIR="$STATE_DIR"
 KEY_TYPE="$KEY_TYPE"
-DEBUG="${DEBUG}"
+DEBUG="$DEBUG"
+LOG_FILE="$LOG_FILE"
 EOF
   chmod 600 "$ENV_FILE" || true
 }
@@ -215,9 +133,7 @@ gen_key_and_csr() {
       openssl ecparam -name "$curve" -genkey -noout -out server.key
       openssl req -new -key server.key -out server.csr -config openssl_san.cnf
       ;;
-    * )
-      die "不支持的 KEY_TYPE：$kt（示例：rsa:2048 或 ec:prime256v1）"
-      ;;
+    * ) die "不支持的 KEY_TYPE：$kt（示例：rsa:2048 或 ec:prime256v1）" ;;
   esac
   debug "使用 KEY_TYPE=$kt"
 }
@@ -226,7 +142,7 @@ issue_once() {
   WORKDIR="$(mktemp -d -t zerossl_${MODE}_${TARGET//\//_}_XXXX)"
   cd "$WORKDIR"
 
-  log "==> 1/7 生成私钥与 CSR (SAN=${MODE^^}:${TARGET})"
+  log "==> 1/7 生成私钥与 CSR (SAN=${MODE^^}:$TARGET)"
   cat > openssl_san.cnf <<EOF
 [ req ]
 prompt = no
@@ -246,21 +162,24 @@ EOF
   log "==> 2/7 创建证书订单 (ZeroSSL API)"
   CREATE_JSON="$(curl -fsS -X POST "https://api.zerossl.com/certificates?access_key=${ACCESS_KEY}" \
     --data-urlencode "certificate_csr@server.csr" \
-    --data "certificate_domains=${TARGET}&certificate_validity_days=${VALID_DAYS}&strict_domains=1")" || true
+    --data "certificate_domains=${TARGET}&certificate_validity_days=${VALID_DAYS}&strict_domains=1" || true)"
+  echo "$CREATE_JSON" > "$STATE_DIR/last_create.json"
 
   CERT_ID="$(echo "$CREATE_JSON" | jq -r '.id // .certificate.id // empty')"
   if [[ -z "${CERT_ID:-}" || "$CERT_ID" == "null" ]]; then
-    echo "$CREATE_JSON" | jq . || true
-    die "创建证书失败（可能是配额、目标不可用等）。"
+    jq . "$STATE_DIR/last_create.json" 2>/dev/null || true
+    die "创建证书失败（可能是配额、套餐限制或 CSR/CN 不匹配）。"
   fi
   log "证书ID：$CERT_ID"
 
   log "==> 3/7 获取 HTTP 文件验证信息"
-  CERT_INFO="$(curl -fsS "https://api.zerossl.com/certificates/${CERT_ID}?access_key=${ACCESS_KEY}")"
-  VALID_NODE="$(echo "$CERT_INFO" | jq -r --arg t "$TARGET" '.validation.other_methods[$t]')"
+  CERT_INFO="$(curl -fsS "https://api.zerossl.com/certificates/${CERT_ID}?access_key=${ACCESS_KEY}" || true)"
+  echo "$CERT_INFO" > "$STATE_DIR/last_certinfo.json"
+
+  VALID_NODE="$(echo "$CERT_INFO" | jq -r --arg t "$TARGET" '.validation.other_methods[$t] // .validation.other_methods[0] // empty')"
   if [[ -z "$VALID_NODE" || "$VALID_NODE" == "null" ]]; then
-    echo "$CERT_INFO" | jq . || true
-    die "未找到验证信息（请确认 TARGET 已解析到本机公网IP/IPv6，且 80 端口对外开放）"
+    jq . "$STATE_DIR/last_certinfo.json" 2>/dev/null || true
+    die "未找到验证信息（请确认 80 端口对外开放，且 $TARGET 已解析到本机）。"
   fi
   FILE_PATH="$(echo "$VALID_NODE" | jq -r '.file_validation_path')"
   FILE_CONTENT="$(echo "$VALID_NODE" | jq -r '.file_validation_content')"
@@ -268,6 +187,8 @@ EOF
 
   log "验证文件URL：$FILE_URL"
   log "验证文件相对路径：$FILE_PATH"
+  echo "$FILE_PATH"    > "$STATE_DIR/last_validation_path.txt"
+  echo "$FILE_CONTENT" > "$STATE_DIR/last_validation_content.txt"
 
   log "==> 4/7 准备验证文件到 Web 根目录"
   if [[ -n "${WEBROOT:-}" ]]; then
@@ -282,6 +203,7 @@ EOF
     if as_root; then
       nohup python3 -m http.server 80 --bind 0.0.0.0 --directory "$WEBROOT" >/dev/null 2>&1 &
       SERVER_PID=$!
+      log "已启动临时服务 PID=$SERVER_PID"
     else
       die "需要 root 权限以监听 80 端口，或设置 WEBROOT 指向现有站点"
     fi
@@ -289,7 +211,7 @@ EOF
 
   log "==> 5/7 触发验证并轮询状态"
   curl -fsS -X POST "https://api.zerossl.com/certificates/${CERT_ID}/challenges?access_key=${ACCESS_KEY}" \
-    --data "validation_method=HTTP_CSR_HASH" >/dev/null
+    --data "validation_method=HTTP_CSR_HASH" >/dev/null || true
 
   STATUS=""
   for _ in $(seq 1 36); do
@@ -297,6 +219,7 @@ EOF
     if [[ -z "$STATUS_JSON" || "$STATUS_JSON" == "Not Found" ]]; then
       STATUS_JSON="$(curl -fsS "https://api.zerossl.com/verification/status?access_key=${ACCESS_KEY}&certificate_id=${CERT_ID}" || true)"
     fi
+    echo "$STATUS_JSON" > "$STATE_DIR/last_status.json"
     STATUS="$(echo "$STATUS_JSON" | jq -r '.status // .validation_status // empty')"
     [[ -z "$STATUS" || "$STATUS" == "null" ]] && STATUS="$(curl -fsS "https://api.zerossl.com/certificates/${CERT_ID}?access_key=${ACCESS_KEY}" | jq -r '.status')"
     log "当前状态：${STATUS:-unknown}"
@@ -329,6 +252,7 @@ EOF
   echo "  Private Key:               $LIVE_DIR/privkey.key"
   echo "  CA Bundle:                 $LIVE_DIR/ca_bundle.crt"
   echo "  Full Chain:                $LIVE_DIR/fullchain.pem"
+  echo "  Log File:                  $LOG_FILE"
   echo
   echo "Nginx 示例:"
   echo "  ssl_certificate     $LIVE_DIR/fullchain.pem;"
@@ -388,9 +312,9 @@ EOF
 install_cron() {
   local script_path; script_path="$(abs_self)"
   [[ -n "$script_path" ]] || die "无法解析脚本绝对路径"
-  local line="17 3 1 * * ACCESS_KEY=$(printf %q "$ACCESS_KEY") MODE=$(printf %q "$MODE") TARGET=$(printf %q "$TARGET") VALID_DAYS=$(printf %q "$VALID_DAYS") WEBROOT=$(printf %q "$WEBROOT") LIVE_DIR=$(printf %q "$LIVE_DIR") STATE_DIR=$(printf %q "$STATE_DIR") CONFIG_DIR=$(printf %q "$CONFIG_DIR") KEY_TYPE=$(printf %q "$KEY_TYPE") DEBUG=$(printf %q "$DEBUG") /usr/bin/env bash $script_path --renew >> /var/log/zerossl_renew.log 2>&1"
+  local line="17 3 1 * * ACCESS_KEY=$(printf %q "$ACCESS_KEY") MODE=$(printf %q "$MODE") TARGET=$(printf %q "$TARGET") VALID_DAYS=$(printf %q "$VALID_DAYS") WEBROOT=$(printf %q "$WEBROOT") LIVE_DIR=$(printf %q "$LIVE_DIR") STATE_DIR=$(printf %q "$STATE_DIR") CONFIG_DIR=$(printf %q "$CONFIG_DIR") KEY_TYPE=$(printf %q "$KEY_TYPE") DEBUG=$(printf %q "$DEBUG") LOG_FILE=$(printf %q "$LOG_FILE") /usr/bin/env bash $script_path --renew >> $LOG_FILE 2>&1"
   (crontab -l 2>/dev/null || true; echo "$line") | crontab -
-  log "已安装 cron 定时任务：每月 1 日 03:17 尝试续签"
+  log "已安装 cron 定时任务：每月 1 日 03:17 尝试续签（日志见 $LOG_FILE）"
 }
 
 main() {
@@ -429,19 +353,3 @@ main() {
 }
 
 main "$@"
-EOF_SCRIPT
-
-  chmod +x "$dst"
-  say "主脚本安装完成：$dst"
-}
-
-run_main_script() {
-  say "==> 启动主脚本（首次运行将引导你完成签发并自动安装续签任务）"
-  /usr/local/bin/zerossl_ip_oneclick_cn.sh
-}
-
-# ====== 主流程 ======
-ensure_root "$@"
-install_deps
-install_main_script
-run_main_script
